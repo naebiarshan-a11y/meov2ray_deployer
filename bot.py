@@ -57,16 +57,32 @@ def gql(token, query, variables=None):
 
 def get_workspace_id(token):
     """اولین workspace اکانت کاربر رو برمی‌گردونه (Railway الان برای ساخت پروژه لازمش داره)."""
-    data = gql(token, """
-        query{ me{ workspaces{ id name } } }
-    """)
+    try:
+        data = gql(token, """
+            query{ me{ workspaces{ id name } } }
+        """)
+    except Exception as e:
+        raise Exception(
+            f"{e}\n(توکن باید Account Token باشه: تو Railway موقع ساخت توکن گزینه "
+            f"«No workspace» رو انتخاب کن)")
     ws = data["me"]["workspaces"]
     if not ws:
         raise Exception("هیچ workspace ای تو اکانت پیدا نشد.")
     return ws[0]["id"]
 
 
-def deploy_panel(token, repo):
+def default_branch(repo):
+    """برنچ پیش‌فرض ریپو رو از API عمومی گیت‌هاب می‌گیره (برای ریپوی Public)."""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{repo}", timeout=15)
+        if r.status_code == 404:
+            raise Exception("ریپو پیدا نشد یا Private هست. ریپو باید Public باشه.")
+        return r.json().get("default_branch", "main")
+    except requests.RequestException:
+        return "main"
+
+
+def deploy_panel(token, repo, port):
     """ریپو رو روی اکانت کاربر دیپلوی می‌کنه (بدون TCP)."""
     name = repo.split("/")[-1]
 
@@ -79,36 +95,54 @@ def deploy_panel(token, repo):
     project_id = p["id"]
     env_id = p["environments"]["edges"][0]["node"]["id"]
 
-    # 2) سرویس از ریپوی گیت‌هاب
+    # 2) سرویس از ریپوی گیت‌هاب (با برنچ مشخص تا دیپلوی تریگر بشه)
+    branch = default_branch(repo)
     s = gql(token, """
-        mutation($pid:String!, $repo:String!){
-          serviceCreate(input:{projectId:$pid, source:{repo:$repo}}){ id } }
-    """, {"pid": project_id, "repo": repo})["serviceCreate"]
+        mutation($i:ServiceCreateInput!){ serviceCreate(input:$i){ id } }
+    """, {"i": {"projectId": project_id, "environmentId": env_id, "name": name,
+                "branch": branch, "source": {"repo": repo},
+                "variables": {"PORT": str(port)}}})["serviceCreate"]
     service_id = s["id"]
 
-    # 3) ریجن هلند (اگه فیلد region قبول نشد، multiRegionConfig رو امتحان می‌کنه)
+    # 3) ریجن هلند: اول multiRegionConfig، اگه نشد فیلد قدیمی region.
+    #    شکست تو این مرحله کل دیپلوی رو خراب نمی‌کنه، فقط هشدار می‌ده.
     region_mutation = """
         mutation($s:String!, $e:String!, $i:ServiceInstanceUpdateInput!){
           serviceInstanceUpdate(serviceId:$s, environmentId:$e, input:$i) }
     """
-    try:
-        gql(token, region_mutation,
-            {"s": service_id, "e": env_id, "i": {"region": REGION}})
-    except Exception:
-        gql(token, region_mutation,
-            {"s": service_id, "e": env_id,
-             "i": {"multiRegionConfig": {REGION: {"numReplicas": 1}}}})
+    region_ok = False
+    for inp in ({"multiRegionConfig": {REGION: {"numReplicas": 1}}},
+                {"region": REGION}):
+        try:
+            gql(token, region_mutation, {"s": service_id, "e": env_id, "i": inp})
+            region_ok = True
+            break
+        except Exception:
+            continue
 
     # 4) دامنه عمومی HTTP
+    #    targetPort = پورتی که خودت زدی (جلوی تشخیص خودکار اشتباه Railway رو می‌گیره)
     d = gql(token, """
-        mutation($s:String!, $e:String!){
-          serviceDomainCreate(input:{serviceId:$s, environmentId:$e}){ domain } }
-    """, {"s": service_id, "e": env_id})["serviceDomainCreate"]
+        mutation($i:ServiceDomainCreateInput!){
+          serviceDomainCreate(input:$i){ domain } }
+    """, {"i": {"serviceId": service_id, "environmentId": env_id,
+                "targetPort": port}})["serviceDomainCreate"]
+
+    # 5) شروع دیپلوی (اگه خودکار شروع نشده باشه)
+    try:
+        gql(token, """
+            mutation($s:String!, $e:String!){
+              serviceInstanceDeploy(serviceId:$s, environmentId:$e) }
+        """, {"s": service_id, "e": env_id})
+    except Exception:
+        pass  # معمولاً سرویس با ساخت از ریپو خودش دیپلوی می‌شه
 
     return {
         "name": name,
         "http": f"https://{d['domain']}",
         "tcp": None,
+        "port": port,
+        "region_ok": region_ok,
         "project_id": project_id,
         "service_id": service_id,
         "env_id": env_id,
@@ -211,8 +245,10 @@ def confirm_kb(ok_data, back_data):
 def panel_text(p):
     return (f"📦 {p.get('name', 'پنل')}\n\n"
             f"🌐 HTTP: {p.get('http', '-')}\n"
+            f"🚪 پورت پنل: {p.get('port', '-')}\n"
             f"🔌 TCP: {p.get('tcp') or 'ندارد'}\n"
-            f"📍 ریجن: هلند (آمستردام)")
+            + ("📍 ریجن: هلند (آمستردام)" if p.get("region_ok", True)
+               else "⚠️ ریجن هلند ست نشد (پیش‌فرض اکانت استفاده می‌شه)"))
 
 
 # ---------------------------------------------------------------
@@ -381,14 +417,31 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not repo:
             await update.message.reply_text("❌ فرمت اشتباهه. مثال: user/repo")
             return
+        if not get_token(uid):
+            await ask_token(update.message, ctx, "repo")
+            return
+        ctx.user_data["pending_repo"] = repo
+        ctx.user_data["waiting"] = "deploy_port"
+        await update.effective_chat.send_message(
+            "🚪 پورت پنل رو بفرست (عدد بین 1 تا 65535).\n"
+            "باید همون پورتی باشه که پنل داخل کانتینر روش گوش می‌ده.")
+
+    elif waiting == "deploy_port":
+        port = valid_port(text)
+        if not port:
+            await update.message.reply_text("❌ پورت نامعتبره. یه عدد بین 1 تا 65535 بفرست.")
+            return
         token = get_token(uid)
-        if not token:
+        repo = ctx.user_data.get("pending_repo")
+        if not token or not repo:
+            ctx.user_data["waiting"] = None
             await ask_token(update.message, ctx, "repo")
             return
         ctx.user_data["waiting"] = None
+        ctx.user_data.pop("pending_repo", None)
         msg = await update.effective_chat.send_message("⏳ در حال دیپلوی روی اکانت تو...")
         try:
-            p = await asyncio.to_thread(deploy_panel, token, repo)
+            p = await asyncio.to_thread(deploy_panel, token, repo, port)
             panels.append(p)
             i = len(panels) - 1
             await msg.edit_text(

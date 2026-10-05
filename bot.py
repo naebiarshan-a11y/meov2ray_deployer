@@ -85,13 +85,31 @@ def deploy_panel(token, repo, port, env_vars=None):
         mutation($s:String!, $e:String!, $port:Int!){
           tcpProxyCreate(input:{serviceId:$s, environmentId:$e,
                                 applicationPort:$port}){
-            domain proxyPort } }
+            id domain proxyPort } }
     """, {"s": service_id, "e": env_id, "port": port})["tcpProxyCreate"]
 
     return {
         "http": f"https://{d['domain']}",
         "tcp": f"{t['domain']}:{t['proxyPort']}",
+        "service_id": service_id,
+        "env_id": env_id,
+        "project_id": project_id,
     }
+
+
+def delete_tcp(token, service_id, env_id):
+    """همه TCP Proxy های سرویس رو پیدا و حذف می‌کنه. تعداد حذف‌شده‌ها رو برمی‌گردونه."""
+    proxies = gql(token, """
+        query($s:String!, $e:String!){
+          tcpProxies(serviceId:$s, environmentId:$e){
+            id domain proxyPort applicationPort } }
+    """, {"s": service_id, "e": env_id})["tcpProxies"]
+
+    for p in proxies:
+        gql(token, """
+            mutation($id:String!){ tcpProxyDelete(id:$id) }
+        """, {"id": p["id"]})
+    return len(proxies)
 
 
 # ---------------------------------------------------------------
@@ -124,7 +142,22 @@ def main_kb(ctx, uid):
         [InlineKeyboardButton(f"📦 ریپو: {repo}", callback_data="set_repo")],
         [InlineKeyboardButton(port_txt, callback_data="set_port")],
         [InlineKeyboardButton("🚀 ساخت پنل", callback_data="create")],
+        [InlineKeyboardButton("🗑 حذف TCP", callback_data="del_menu")],
     ])
+
+
+def panels_kb(panels):
+    rows = [[InlineKeyboardButton(f"🗑 {p['tcp']}", callback_data=f"del_{i}")]
+            for i, p in enumerate(panels)]
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def confirm_kb(i):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"delok_{i}"),
+        InlineKeyboardButton("❌ لغو", callback_data="del_menu"),
+    ]])
 
 
 # ---------------------------------------------------------------
@@ -155,6 +188,51 @@ async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "پورت پنلت رو بفرست (عدد بین 1 تا 65535).\n"
             "باید همون پورتی باشه که پنل داخل کانتینر روش گوش می‌ده.")
 
+    elif q.data == "home":
+        await q.edit_message_text("منوی اصلی 👇", reply_markup=main_kb(ctx, uid))
+
+    elif q.data == "del_menu":
+        panels = ctx.user_data.get("panels", [])
+        if not TOKENS.get(uid):
+            await q.edit_message_text("اول توکن Railway رو ثبت کن.",
+                                      reply_markup=main_kb(ctx, uid))
+        elif not panels:
+            await q.edit_message_text("هیچ TCP ای برای حذف ثبت نشده.",
+                                      reply_markup=main_kb(ctx, uid))
+        else:
+            await q.edit_message_text("کدوم TCP حذف بشه؟",
+                                      reply_markup=panels_kb(panels))
+
+    elif q.data.startswith("del_") and q.data[4:].isdigit():
+        i = int(q.data[4:])
+        panels = ctx.user_data.get("panels", [])
+        if i >= len(panels):
+            await q.edit_message_text("❌ پیدا نشد.", reply_markup=main_kb(ctx, uid))
+            return
+        await q.edit_message_text(
+            f"مطمئنی TCP زیر حذف بشه؟\n\n🔌 {panels[i]['tcp']}",
+            reply_markup=confirm_kb(i))
+
+    elif q.data.startswith("delok_"):
+        i = int(q.data[6:])
+        panels = ctx.user_data.get("panels", [])
+        token = TOKENS.get(uid)
+        if not token or i >= len(panels):
+            await q.edit_message_text("❌ توکن یا پنل پیدا نشد.",
+                                      reply_markup=main_kb(ctx, uid))
+            return
+        await q.edit_message_text("⏳ در حال حذف TCP...")
+        try:
+            p = panels[i]
+            n = await asyncio.to_thread(delete_tcp, token, p["service_id"], p["env_id"])
+            panels.pop(i)
+            await q.edit_message_text(f"✅ {n} تا TCP Proxy حذف شد.",
+                                      reply_markup=main_kb(ctx, uid))
+        except Exception as e:
+            await q.edit_message_text(f"❌ خطا: {e}", reply_markup=main_kb(ctx, uid))
+        finally:
+            TOKENS.pop(uid, None)
+
     elif q.data == "create":
         token = TOKENS.get(uid)
         if not token:
@@ -174,6 +252,11 @@ async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             res = await asyncio.to_thread(
                 deploy_panel, token, repo, port, {"PORT": str(port)})
+            ctx.user_data.setdefault("panels", []).append({
+                "tcp": res["tcp"],
+                "service_id": res["service_id"],
+                "env_id": res["env_id"],
+            })
             await q.edit_message_text(
                 f"✅ پنل ساخته شد:\n\n"
                 f"🌐 HTTP: {res['http']}\n"

@@ -55,15 +55,27 @@ def gql(token, query, variables=None):
     return data["data"]
 
 
+def get_workspace_id(token):
+    """اولین workspace اکانت کاربر رو برمی‌گردونه (Railway الان برای ساخت پروژه لازمش داره)."""
+    data = gql(token, """
+        query{ me{ workspaces{ id name } } }
+    """)
+    ws = data["me"]["workspaces"]
+    if not ws:
+        raise Exception("هیچ workspace ای تو اکانت پیدا نشد.")
+    return ws[0]["id"]
+
+
 def deploy_panel(token, repo):
     """ریپو رو روی اکانت کاربر دیپلوی می‌کنه (بدون TCP)."""
     name = repo.split("/")[-1]
 
-    # 1) پروژه
+    # 1) پروژه (داخل workspace کاربر)
+    workspace_id = get_workspace_id(token)
     p = gql(token, """
-        mutation($n:String!){ projectCreate(input:{name:$n}){
+        mutation($i:ProjectCreateInput!){ projectCreate(input:$i){
             id environments{ edges{ node{ id } } } } }
-    """, {"n": name})["projectCreate"]
+    """, {"i": {"name": name, "workspaceId": workspace_id}})["projectCreate"]
     project_id = p["id"]
     env_id = p["environments"]["edges"][0]["node"]["id"]
 

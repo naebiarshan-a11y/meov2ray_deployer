@@ -673,7 +673,7 @@ def repository_keyboard():
         ],
         [
             InlineKeyboardButton(
-                "📦 پروژه من",
+                "📦 3x-ui",
                 callback_data="repo_my",
             )
         ],
@@ -687,6 +687,52 @@ def repository_keyboard():
             InlineKeyboardButton(
                 "🔙 بازگشت",
                 callback_data="home",
+            )
+        ],
+    ])
+
+
+def xui_port_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔘 پورت 2053",
+                callback_data="port_2053",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔘 انتخاب پورت دلخواه",
+                callback_data="port_custom",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 بازگشت",
+                callback_data="new",
+            )
+        ],
+    ])
+
+
+def spider_port_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔘 پورت 8080",
+                callback_data="port_8080",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔘 انتخاب پورت دلخواه",
+                callback_data="port_custom",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 بازگشت",
+                callback_data="new",
             )
         ],
     ])
@@ -1051,18 +1097,17 @@ async def button_handler(
         )
         return
 
-    # MY REPOSITORY
+    # MY REPOSITORY / 3x-ui
     if data == "repo_my":
         user_data["pending_repo"] = MY_REPO
-        user_data["waiting"] = "deploy_port"
+        user_data.pop("waiting", None)
 
         await query.edit_message_text(
-            "📦 <b>پروژه من انتخاب شد</b>\n\n"
+            "📦 <b>3x-ui</b> انتخاب شد.\n\n"
             "🔗 Repository:\n"
             f"<code>https://github.com/{MY_REPO}.git</code>\n\n"
-            "حالا <b>پورت برنامه</b> را ارسال کن.\n\n"
-            "مثال:\n"
-            "<code>8080</code>",
+            "پورت برنامه را انتخاب کن:",
+            reply_markup=xui_port_keyboard(),
             parse_mode="HTML",
         )
         return
@@ -1070,15 +1115,131 @@ async def button_handler(
     # SPIDERPANEL
     if data == "repo_spider":
         user_data["pending_repo"] = SPIDER_REPO
+        user_data.pop("waiting", None)
+
+        await query.edit_message_text(
+            "🕷️ <b>SpiderPanel</b> انتخاب شد.\n\n"
+            "🔗 Repository:\n"
+            f"<code>https://github.com/{SPIDER_REPO}.git</code>\n\n"
+            "پورت برنامه را انتخاب کن:",
+            reply_markup=spider_port_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    # 3x-ui default port
+    if data == "port_2053":
+        user_data["pending_port"] = 2053
+        user_data["waiting"] = None
+
+        repo = user_data.get("pending_repo")
+        if repo != MY_REPO:
+            await query.edit_message_text(
+                "❌ Repository مربوط به 3x-ui پیدا نشد.",
+                reply_markup=repository_keyboard(),
+            )
+            return
+
+        await query.edit_message_text(
+            "⏳ در حال ساخت 3x-ui روی Railway...",
+        )
+
+        try:
+            token = get_active_token(user_data)
+            token_id = get_active_token_id(user_data)
+            if not token or not token_id:
+                raise RuntimeError("توکن Railway فعال پیدا نشد.")
+
+            panel = await asyncio.to_thread(
+                deploy_panel, token, repo, 2053
+            )
+            panel["token_id"] = token_id
+            panels = get_panels(user_data)
+            panels.append(panel)
+            index = len(panels) - 1
+            user_data.pop("pending_repo", None)
+            user_data.pop("pending_port", None)
+
+            await query.edit_message_text(
+                "✅ 3x-ui با موفقیت ساخته شد!\n\n" + panel_text(panel),
+                reply_markup=panel_keyboard(index, panel),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            user_data.pop("pending_repo", None)
+            user_data.pop("pending_port", None)
+            await query.edit_message_text(
+                "❌ خطا در ساخت 3x-ui:\n\n"
+                f"<code>{exc}</code>",
+                reply_markup=main_menu(user_data),
+                parse_mode="HTML",
+            )
+        return
+
+    # SpiderPanel default port
+    if data == "port_8080":
+        user_data["pending_port"] = 8080
+        user_data["waiting"] = None
+
+        repo = user_data.get("pending_repo")
+        if repo != SPIDER_REPO:
+            await query.edit_message_text(
+                "❌ Repository مربوط به SpiderPanel پیدا نشد.",
+                reply_markup=repository_keyboard(),
+            )
+            return
+
+        await query.edit_message_text(
+            "⏳ در حال ساخت SpiderPanel روی Railway...",
+        )
+
+        try:
+            token = get_active_token(user_data)
+            token_id = get_active_token_id(user_data)
+            if not token or not token_id:
+                raise RuntimeError("توکن Railway فعال پیدا نشد.")
+
+            panel = await asyncio.to_thread(
+                deploy_panel, token, repo, 8080
+            )
+            panel["token_id"] = token_id
+            panels = get_panels(user_data)
+            panels.append(panel)
+            index = len(panels) - 1
+            user_data.pop("pending_repo", None)
+            user_data.pop("pending_port", None)
+
+            await query.edit_message_text(
+                "✅ SpiderPanel با موفقیت ساخته شد!\n\n" + panel_text(panel),
+                reply_markup=panel_keyboard(index, panel),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            user_data.pop("pending_repo", None)
+            user_data.pop("pending_port", None)
+            await query.edit_message_text(
+                "❌ خطا در ساخت SpiderPanel:\n\n"
+                f"<code>{exc}</code>",
+                reply_markup=main_menu(user_data),
+                parse_mode="HTML",
+            )
+        return
+
+    # Custom port for selected repository
+    if data == "port_custom":
+        if not user_data.get("pending_repo"):
+            await query.edit_message_text(
+                "❌ ابتدا Repository را انتخاب کن.",
+                reply_markup=repository_keyboard(),
+            )
+            return
+
         user_data["waiting"] = "deploy_port"
 
         await query.edit_message_text(
-            "🕷️ <b>SpiderPanel انتخاب شد</b>\n\n"
-            "🔗 Repository:\n"
-            f"<code>https://github.com/{SPIDER_REPO}.git</code>\n\n"
-            "حالا <b>پورت برنامه</b> را ارسال کن.\n\n"
-            "مثال:\n"
-            "<code>8080</code>",
+            "🔌 <b>پورت دلخواه را ارسال کن:</b>\n\n"
+            "مثال: <code>8080</code>\n\n"
+            "پورت باید عددی بین 1 تا 65535 باشد.",
             parse_mode="HTML",
         )
         return
@@ -1533,6 +1694,7 @@ async def text_handler(
             return
 
         repo = user_data.pop("pending_repo", None)
+        user_data.pop("pending_port", None)
         token = get_active_token(user_data)
         token_id = get_active_token_id(user_data)
 

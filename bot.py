@@ -230,12 +230,18 @@ def default_branch(repo):
 # =========================================================
 
 def deploy_panel(token, repo, port):
-    workspace_id = get_workspace_id(token)
+    """
+    Deploy a GitHub repository as a Railway service.
 
-    if not workspace_id:
-        raise Exception(
-            "توکن Railway معتبر نیست یا Workspace پیدا نشد."
-        )
+    This implementation follows the current Railway Public GraphQL API:
+    - projectCreate -> Project directly
+    - serviceCreate -> Service directly (NOT { service { ... } })
+    - environments(projectId: ...)
+    - variableUpsert with projectId
+    - serviceInstanceUpdate for region
+    - serviceDomainCreate -> Domain directly
+    - serviceInstanceDeployV2
+    """
 
     branch = default_branch(repo)
 
@@ -245,7 +251,9 @@ def deploy_panel(token, repo, port):
         .replace(".", "-")
     )
 
-    # Create project
+    # ---------------------------------------------------------
+    # Project
+    # ---------------------------------------------------------
     project_mutation = """
     mutation ProjectCreate($input: ProjectCreateInput!) {
         projectCreate(input: $input) {
@@ -255,16 +263,30 @@ def deploy_panel(token, repo, port):
     }
     """
 
+    # New Railway schemas may not expose workspaceId on
+    # ProjectCreateInput. Try it when available, then fall back
+    # to the documented minimal form.
+    workspace_id = get_workspace_id(token)
+
+    project_input = {
+        "name": project_name,
+    }
+
+    if workspace_id:
+        project_input["workspaceId"] = workspace_id
+
     data, error = railway_request(
         token,
         project_mutation,
-        {
-            "input": {
-                "name": project_name,
-                "workspaceId": workspace_id,
-            }
-        },
+        {"input": project_input},
     )
+
+    if error and "workspaceId" in str(error):
+        data, error = railway_request(
+            token,
+            project_mutation,
+            {"input": {"name": project_name}},
+        )
 
     if error:
         raise Exception(
@@ -274,17 +296,25 @@ def deploy_panel(token, repo, port):
             )
         )
 
+    if not data or not data.get("projectCreate"):
+        raise Exception("Railway پروژه را ایجاد نکرد.")
+
     project = data["projectCreate"]
     project_id = project["id"]
 
-    # Create service
+    # ---------------------------------------------------------
+    # Service
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    # Railway returns Service directly:
+    # serviceCreate(...) { id name }
+    # NOT:
+    # serviceCreate(...) { service { id name } }
     service_mutation = """
     mutation ServiceCreate($input: ServiceCreateInput!) {
         serviceCreate(input: $input) {
-            service {
-                id
-                name
-            }
+            id
+            name
         }
     }
     """
@@ -294,7 +324,6 @@ def deploy_panel(token, repo, port):
         "name": "app",
         "source": {
             "repo": repo,
-            "branch": branch,
         },
     }
 
@@ -305,6 +334,8 @@ def deploy_panel(token, repo, port):
     )
 
     if error:
+        # If a partial project was created and service creation failed,
+        # surface the real Railway error instead of hiding it.
         raise Exception(
             error[0].get(
                 "message",
@@ -312,12 +343,55 @@ def deploy_panel(token, repo, port):
             )
         )
 
-    service_id = data["serviceCreate"]["service"]["id"]
+    if not data or not data.get("serviceCreate"):
+        raise Exception("Railway سرویس را ایجاد نکرد.")
 
+    service = data["serviceCreate"]
+    service_id = service["id"]
+
+    # ---------------------------------------------------------
+    # Connect the exact branch
+    # ---------------------------------------------------------
+    # serviceCreate's documented GitHub source only needs repo.
+    # Branch is configured separately through serviceConnect.
+    if branch:
+        connect_mutation = """
+        mutation ServiceConnect(
+            $id: String!,
+            $input: ServiceConnectInput!
+        ) {
+            serviceConnect(id: $id, input: $input) {
+                id
+            }
+        }
+        """
+
+        _, connect_error = railway_request(
+            token,
+            connect_mutation,
+            {
+                "id": service_id,
+                "input": {
+                    "repo": repo,
+                    "branch": branch,
+                },
+            },
+        )
+
+        # Do not fail the whole deployment if the repo's default
+        # branch was already selected by Railway.
+        if connect_error:
+            print(
+                "Railway serviceConnect warning:",
+                connect_error,
+            )
+
+    # ---------------------------------------------------------
     # Environment
+    # ---------------------------------------------------------
     env_query = """
     query Environments($projectId: String!) {
-        environments(projectId: $projectId, isEphemeral: false) {
+        environments(projectId: $projectId) {
             edges {
                 node {
                     id
@@ -343,14 +417,31 @@ def deploy_panel(token, repo, port):
         )
 
     try:
-        env_id = (
-            data["environments"]["edges"][0]
-            ["node"]["id"]
-        )
+        environments = data["environments"]["edges"]
+        if not environments:
+            raise ValueError("empty environment list")
+
+        # Prefer Production, otherwise use the first non-ephemeral
+        # environment returned by Railway.
+        env_id = None
+
+        for edge in environments:
+            node = edge.get("node", {})
+            name = (node.get("name") or "").lower()
+
+            if name == "production":
+                env_id = node.get("id")
+                break
+
+        if not env_id:
+            env_id = environments[0]["node"]["id"]
+
     except Exception:
         raise Exception("Environment پروژه پیدا نشد.")
 
-    # PORT
+    # ---------------------------------------------------------
+    # PORT variable
+    # ---------------------------------------------------------
     variable_mutation = """
     mutation VariableUpsert($input: VariableUpsertInput!) {
         variableUpsert(input: $input)
@@ -362,6 +453,7 @@ def deploy_panel(token, repo, port):
         variable_mutation,
         {
             "input": {
+                "projectId": project_id,
                 "environmentId": env_id,
                 "serviceId": service_id,
                 "name": "PORT",
@@ -370,14 +462,30 @@ def deploy_panel(token, repo, port):
         },
     )
 
+    if variable_error:
+        raise Exception(
+            variable_error[0].get(
+                "message",
+                "خطا در تنظیم PORT",
+            )
+        )
+
+    # ---------------------------------------------------------
     # Region
+    # ---------------------------------------------------------
     region_ok = False
 
     region_mutation = """
     mutation ServiceInstanceUpdate(
+        $serviceId: String!,
+        $environmentId: String!,
         $input: ServiceInstanceUpdateInput!
     ) {
-        serviceInstanceUpdate(input: $input)
+        serviceInstanceUpdate(
+            serviceId: $serviceId,
+            environmentId: $environmentId,
+            input: $input
+        )
     }
     """
 
@@ -385,29 +493,32 @@ def deploy_panel(token, repo, port):
         token,
         region_mutation,
         {
+            "serviceId": service_id,
+            "environmentId": env_id,
             "input": {
-                "serviceId": service_id,
-                "environmentId": env_id,
-                "multiRegionConfig": {
-                    REGION: 1,
-                },
-            }
+                "region": REGION,
+            },
         },
     )
 
     if not region_error:
         region_ok = True
+    else:
+        print(
+            "Railway region warning:",
+            region_error,
+        )
 
-    # Domain
+    # ---------------------------------------------------------
+    # Railway public domain
+    # ---------------------------------------------------------
     domain_mutation = """
     mutation ServiceDomainCreate(
         $input: ServiceDomainCreateInput!
     ) {
         serviceDomainCreate(input: $input) {
-            domain {
-                id
-                domain
-            }
+            id
+            domain
         }
     }
     """
@@ -427,27 +538,26 @@ def deploy_panel(token, repo, port):
 
     if not domain_error:
         try:
-            http_domain = (
-                data["serviceDomainCreate"]
-                ["domain"]["domain"]
-            )
+            http_domain = data["serviceDomainCreate"]["domain"]
         except Exception:
-            pass
+            http_domain = None
 
+    # ---------------------------------------------------------
     # Deploy
+    # ---------------------------------------------------------
     deploy_mutation = """
-    mutation ServiceInstanceDeploy(
+    mutation ServiceInstanceDeployV2(
         $serviceId: String!,
         $environmentId: String!
     ) {
-        serviceInstanceDeploy(
+        serviceInstanceDeployV2(
             serviceId: $serviceId,
             environmentId: $environmentId
         )
     }
     """
 
-    railway_request(
+    deploy_data, deploy_error = railway_request(
         token,
         deploy_mutation,
         {
@@ -455,6 +565,38 @@ def deploy_panel(token, repo, port):
             "environmentId": env_id,
         },
     )
+
+    # Keep compatibility with accounts/schemas where the older
+    # deployment mutation is still available.
+    if deploy_error:
+        fallback_deploy_mutation = """
+        mutation ServiceInstanceDeploy(
+            $serviceId: String!,
+            $environmentId: String!
+        ) {
+            serviceInstanceDeploy(
+                serviceId: $serviceId,
+                environmentId: $environmentId
+            )
+        }
+        """
+
+        deploy_data, deploy_error = railway_request(
+            token,
+            fallback_deploy_mutation,
+            {
+                "serviceId": service_id,
+                "environmentId": env_id,
+            },
+        )
+
+    if deploy_error:
+        raise Exception(
+            deploy_error[0].get(
+                "message",
+                "خطا در Deploy سرویس",
+            )
+        )
 
     http_url = None
 
@@ -468,6 +610,7 @@ def deploy_panel(token, repo, port):
     return {
         "name": project_name,
         "repo": repo,
+        "branch": branch,
         "http": http_url,
         "port": port,
         "region": REGION,
@@ -477,11 +620,8 @@ def deploy_panel(token, repo, port):
         "env_id": env_id,
         "tcps": [],
         "created_at": int(time.time()),
-        "port_error": (
-            variable_error[0].get("message")
-            if variable_error
-            else None
-        ),
+        "port_error": None,
+        "deploy_ok": True,
     }
 
 

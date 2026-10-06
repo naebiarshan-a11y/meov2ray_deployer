@@ -31,7 +31,8 @@ DATA_FILE = os.path.join(DATA_DIR, "bot_data.pickle")
 
 MAX_TCPS = 3
 
-MY_REPO = "naebiarshan-a11y/meov2ray_deployer"
+MY_REPO = "imdhadwad/3x-ui-docker"
+XUI_VOLUME_MOUNT = "/etc/x-ui"
 SPIDER_REPO = "amirh00sain/SpiderPanel"
 
 
@@ -245,11 +246,14 @@ def deploy_panel(token, repo, port):
 
     branch = default_branch(repo)
 
-    project_name = (
-        repo.split("/")[-1]
-        .replace("_", "-")
-        .replace(".", "-")
-    )
+    if repo == MY_REPO:
+        project_name = "3x-ui"
+    else:
+        project_name = (
+            repo.split("/")[-1]
+            .replace("_", "-")
+            .replace(".", "-")
+        )
 
     # ---------------------------------------------------------
     # Project
@@ -321,7 +325,7 @@ def deploy_panel(token, repo, port):
 
     service_input = {
         "projectId": project_id,
-        "name": "app",
+        "name": "3x-ui" if repo == MY_REPO else "app",
         "source": {
             "repo": repo,
         },
@@ -510,6 +514,48 @@ def deploy_panel(token, repo, port):
         )
 
     # ---------------------------------------------------------
+    # Persistent Volume for 3x-ui
+    # ---------------------------------------------------------
+    # The 3x-ui database/config must survive redeploys.
+    # Railway Public API supports creating a volume directly
+    # with projectId, serviceId and mountPath.
+    volume_id = None
+
+    if repo == MY_REPO:
+        volume_mutation = """
+        mutation VolumeCreate($input: VolumeCreateInput!) {
+            volumeCreate(input: $input) {
+                id
+            }
+        }
+        """
+
+        volume_data, volume_error = railway_request(
+            token,
+            volume_mutation,
+            {
+                "input": {
+                    "projectId": project_id,
+                    "serviceId": service_id,
+                    "mountPath": XUI_VOLUME_MOUNT,
+                }
+            },
+        )
+
+        if volume_error:
+            raise Exception(
+                volume_error[0].get(
+                    "message",
+                    "خطا در ساخت Volume",
+                )
+            )
+
+        try:
+            volume_id = volume_data["volumeCreate"]["id"]
+        except Exception:
+            raise Exception("Railway Volume را ایجاد نکرد.")
+
+    # ---------------------------------------------------------
     # Railway public domain
     # ---------------------------------------------------------
     domain_mutation = """
@@ -618,6 +664,8 @@ def deploy_panel(token, repo, port):
         "project_id": project_id,
         "service_id": service_id,
         "env_id": env_id,
+        "volume_id": volume_id,
+        "volume_mount": XUI_VOLUME_MOUNT if repo == MY_REPO else None,
         "tcps": [],
         "created_at": int(time.time()),
         "port_error": None,
@@ -975,7 +1023,12 @@ def panel_text(panel):
         f"📁 Repo: {panel.get('repo', '-')}\n\n"
         f"⚙️ Port: {panel.get('port', '-')}\n\n"
         f"🌍 Region: {panel.get('region', '-')}\n\n"
-        f"🔌 TCP: {len(tcps)}/{MAX_TCPS}\n"
+        + (
+            f"💾 Volume: <code>{panel.get('volume_mount')}</code>\n\n"
+            if panel.get("volume_mount")
+            else ""
+        )
+        + f"🔌 TCP: {len(tcps)}/{MAX_TCPS}\n"
     )
 
     for index, tcp in enumerate(tcps, 1):

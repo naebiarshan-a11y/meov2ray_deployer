@@ -3,489 +3,1937 @@ import re
 import time
 import asyncio
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (ApplicationBuilder, CommandHandler, PicklePersistence,
-                          CallbackQueryHandler, MessageHandler,
-                          ContextTypes, filters)
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    PicklePersistence,
+)
+
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN تنظیم نشده. تو Railway > Service > Variables اضافه‌اش کن.")
 
 RAILWAY_API = "https://backboard.railway.com/graphql/v2"
-REGION = "europe-west4-drams3a"  # هلند (آمستردام)
 
-# محل ذخیره اطلاعات ربات. روی Railway باید یه Volume به /data وصل کنی
-DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
+REGION = "europe-west4-drams3a"
+
+DATA_DIR = os.environ.get(
+    "DATA_DIR",
+    "/data" if os.path.isdir("/data") else "."
+)
+
 DATA_FILE = os.path.join(DATA_DIR, "bot_data.pickle")
 
-# توکن Railway کاربرها فقط تو حافظه می‌مونه (ذخیره روی دیسک نمی‌شه) و بعد از ۳۰ دقیقه بی‌کاری پاک می‌شه
-TOKEN_TTL = 30 * 60
-TOKENS = {}  # uid -> (token, expire_time)
+MAX_TCPS = 3
 
 
-def set_token(uid, token):
-    TOKENS[uid] = (token, time.time() + TOKEN_TTL)
+# =========================================================
+# RAILWAY GRAPHQL
+# =========================================================
 
-
-def get_token(uid):
-    v = TOKENS.get(uid)
-    if not v:
-        return None
-    if v[1] < time.time():
-        TOKENS.pop(uid, None)
-        return None
-    TOKENS[uid] = (v[0], time.time() + TOKEN_TTL)  # تمدید
-    return v[0]
-
-
-# ---------------------------------------------------------------
-# Railway GraphQL
-# ---------------------------------------------------------------
-def gql(token, query, variables=None):
-    r = requests.post(
-        RAILWAY_API,
-        json={"query": query, "variables": variables or {}},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=60,
-    )
-    data = r.json()
-    if "errors" in data:
-        raise Exception(data["errors"][0]["message"])
-    return data["data"]
-
-
-def get_workspace_id(token):
-    """اولین workspace اکانت کاربر رو برمی‌گردونه (Railway الان برای ساخت پروژه لازمش داره)."""
+def railway_request(token, query, variables=None):
     try:
-        data = gql(token, """
-            query{ me{ workspaces{ id name } } }
-        """)
-    except Exception as e:
-        raise Exception(
-            f"{e}\n(توکن باید Account Token باشه: تو Railway موقع ساخت توکن گزینه "
-            f"«No workspace» رو انتخاب کن)")
-    ws = data["me"]["workspaces"]
-    if not ws:
-        raise Exception("هیچ workspace ای تو اکانت پیدا نشد.")
-    return ws[0]["id"]
+        r = requests.post(
+            RAILWAY_API,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "query": query,
+                "variables": variables or {},
+            },
+            timeout=30,
+        )
 
+        data = r.json()
+
+        if data.get("errors"):
+            return None, data["errors"]
+
+        return data.get("data"), None
+
+    except Exception as e:
+        return None, [{"message": str(e)}]
+
+
+# =========================================================
+# TOKEN MANAGEMENT
+# =========================================================
+
+def get_tokens(user_data):
+    return user_data.setdefault("railway_tokens", {})
+
+
+def get_active_token_id(user_data):
+    return user_data.get("active_token_id")
+
+
+def get_active_token(user_data):
+    token_id = get_active_token_id(user_data)
+
+    if not token_id:
+        return None
+
+    item = get_tokens(user_data).get(token_id)
+
+    if not item:
+        return None
+
+    return item.get("token")
+
+
+def add_token(user_data, token):
+    tokens = get_tokens(user_data)
+
+    number = len(tokens) + 1
+
+    token_id = str(int(time.time() * 1000000))
+
+    tokens[token_id] = {
+        "name": f"توکن {number}",
+        "token": token,
+    }
+
+    user_data["active_token_id"] = token_id
+
+    return token_id
+
+
+def delete_token(user_data, token_id):
+    tokens = get_tokens(user_data)
+
+    if token_id not in tokens:
+        return False
+
+    del tokens[token_id]
+
+    if user_data.get("active_token_id") == token_id:
+        if tokens:
+            user_data["active_token_id"] = next(iter(tokens))
+        else:
+            user_data.pop("active_token_id", None)
+
+    return True
+
+
+def get_token_for_panel(user_data, panel):
+    token_id = panel.get("token_id")
+
+    if not token_id:
+        return None
+
+    item = get_tokens(user_data).get(token_id)
+
+    if not item:
+        return None
+
+    return item.get("token")
+
+
+# =========================================================
+# PANEL STORAGE
+# =========================================================
+
+def get_panels(user_data):
+    panels = user_data.setdefault("panels", [])
+
+    for panel in panels:
+        normalize_panel(panel)
+
+    return panels
+
+
+def normalize_panel(panel):
+    """
+    تبدیل ساختار قدیمی TCP به ساختار جدید.
+    """
+
+    if "tcps" not in panel:
+        panel["tcps"] = []
+
+        old_tcp = panel.get("tcp")
+
+        if old_tcp:
+            panel["tcps"].append({
+                "id": None,
+                "domain": None,
+                "proxy_port": None,
+                "application_port": panel.get("port"),
+                "address": old_tcp,
+            })
+
+    panel.pop("tcp", None)
+
+
+# =========================================================
+# GITHUB
+# =========================================================
 
 def default_branch(repo):
-    """برنچ پیش‌فرض ریپو رو از API عمومی گیت‌هاب می‌گیره (برای ریپوی Public)."""
     try:
-        r = requests.get(f"https://api.github.com/repos/{repo}", timeout=15)
-        if r.status_code == 404:
-            raise Exception("ریپو پیدا نشد یا Private هست. ریپو باید Public باشه.")
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}",
+            timeout=20,
+        )
+
+        if r.status_code != 200:
+            return "main"
+
         return r.json().get("default_branch", "main")
-    except requests.RequestException:
+
+    except Exception:
         return "main"
 
 
-def deploy_panel(token, repo, port):
-    """ریپو رو روی اکانت کاربر دیپلوی می‌کنه (بدون TCP)."""
-    name = repo.split("/")[-1]
+# =========================================================
+# RAILWAY WORKSPACE
+# =========================================================
 
-    # 1) پروژه (داخل workspace کاربر)
-    workspace_id = get_workspace_id(token)
-    p = gql(token, """
-        mutation($i:ProjectCreateInput!){ projectCreate(input:$i){
-            id environments{ edges{ node{ id } } } } }
-    """, {"i": {"name": name, "workspaceId": workspace_id}})["projectCreate"]
-    project_id = p["id"]
-    env_id = p["environments"]["edges"][0]["node"]["id"]
-
-    # 2) سرویس از ریپوی گیت‌هاب (با برنچ مشخص تا دیپلوی تریگر بشه)
-    branch = default_branch(repo)
-    s = gql(token, """
-        mutation($i:ServiceCreateInput!){ serviceCreate(input:$i){ id } }
-    """, {"i": {"projectId": project_id, "environmentId": env_id, "name": name,
-                "branch": branch, "source": {"repo": repo},
-                "variables": {"PORT": str(port)}}})["serviceCreate"]
-    service_id = s["id"]
-
-    # 3) ریجن هلند: اول multiRegionConfig، اگه نشد فیلد قدیمی region.
-    #    شکست تو این مرحله کل دیپلوی رو خراب نمی‌کنه، فقط هشدار می‌ده.
-    region_mutation = """
-        mutation($s:String!, $e:String!, $i:ServiceInstanceUpdateInput!){
-          serviceInstanceUpdate(serviceId:$s, environmentId:$e, input:$i) }
+def get_workspace_id(token):
+    query = """
+    query {
+        me {
+            workspaces {
+                id
+                name
+            }
+        }
+    }
     """
-    region_ok = False
-    for inp in ({"multiRegionConfig": {REGION: {"numReplicas": 1}}},
-                {"region": REGION}):
-        try:
-            gql(token, region_mutation, {"s": service_id, "e": env_id, "i": inp})
-            region_ok = True
-            break
-        except Exception:
-            continue
 
-    # 4) دامنه عمومی HTTP
-    #    targetPort = پورتی که خودت زدی (جلوی تشخیص خودکار اشتباه Railway رو می‌گیره)
-    d = gql(token, """
-        mutation($i:ServiceDomainCreateInput!){
-          serviceDomainCreate(input:$i){ domain } }
-    """, {"i": {"serviceId": service_id, "environmentId": env_id,
-                "targetPort": port}})["serviceDomainCreate"]
+    data, error = railway_request(token, query)
 
-    # 5) شروع دیپلوی (اگه خودکار شروع نشده باشه)
+    if error:
+        return None
+
     try:
-        gql(token, """
-            mutation($s:String!, $e:String!){
-              serviceInstanceDeploy(serviceId:$s, environmentId:$e) }
-        """, {"s": service_id, "e": env_id})
+        workspaces = data["me"]["workspaces"]
+
+        if not workspaces:
+            return None
+
+        return workspaces[0]["id"]
+
     except Exception:
-        pass  # معمولاً سرویس با ساخت از ریپو خودش دیپلوی می‌شه
+        return None
+
+
+# =========================================================
+# DEPLOY PANEL
+# =========================================================
+
+def deploy_panel(token, repo, port):
+    workspace_id = get_workspace_id(token)
+
+    if not workspace_id:
+        raise Exception(
+            "توکن Railway معتبر نیست یا Workspace پیدا نشد."
+        )
+
+    branch = default_branch(repo)
+
+    # -----------------------------------------
+    # CREATE PROJECT
+    # -----------------------------------------
+
+    project_mutation = """
+    mutation ProjectCreate($input: ProjectCreateInput!) {
+        projectCreate(input: $input) {
+            project {
+                id
+                name
+            }
+        }
+    }
+    """
+
+    project_name = (
+        repo.split("/")[-1]
+        .replace("_", "-")
+        .replace(".", "-")
+    )
+
+    data, error = railway_request(
+        token,
+        project_mutation,
+        {
+            "input": {
+                "name": project_name,
+                "workspaceId": workspace_id,
+            }
+        },
+    )
+
+    if error:
+        raise Exception(error[0].get("message", "خطا در ساخت Project"))
+
+    project = data["projectCreate"]["project"]
+
+    project_id = project["id"]
+
+    # -----------------------------------------
+    # CREATE SERVICE
+    # -----------------------------------------
+
+    service_mutation = """
+    mutation ServiceCreate($input: ServiceCreateInput!) {
+        serviceCreate(input: $input) {
+            service {
+                id
+                name
+            }
+        }
+    }
+    """
+
+    service_input = {
+        "projectId": project_id,
+        "name": "app",
+        "source": {
+            "repo": repo,
+            "branch": branch,
+        },
+    }
+
+    data, error = railway_request(
+        token,
+        service_mutation,
+        {
+            "input": service_input,
+        },
+    )
+
+    if error:
+        raise Exception(
+            error[0].get("message", "خطا در ساخت Service")
+        )
+
+    service = data["serviceCreate"]["service"]
+
+    service_id = service["id"]
+
+    # -----------------------------------------
+    # GET ENVIRONMENT
+    # -----------------------------------------
+
+    env_query = """
+    query Project($id: String!) {
+        project(id: $id) {
+            environments {
+                edges {
+                    node {
+                        id
+                        name
+                    }
+                }
+            }
+        }
+    }
+    """
+
+    data, error = railway_request(
+        token,
+        env_query,
+        {
+            "id": project_id,
+        },
+    )
+
+    if error:
+        raise Exception(
+            error[0].get("message", "خطا در دریافت Environment")
+        )
+
+    env_id = (
+        data["project"]["environments"]["edges"][0]["node"]["id"]
+    )
+
+    # -----------------------------------------
+    # SET PORT
+    # -----------------------------------------
+
+    try:
+        variable_mutation = """
+        mutation VariableUpsert(
+            $input: VariableUpsertInput!
+        ) {
+            variableUpsert(input: $input)
+        }
+        """
+
+        railway_request(
+            token,
+            variable_mutation,
+            {
+                "input": {
+                    "environmentId": env_id,
+                    "serviceId": service_id,
+                    "name": "PORT",
+                    "value": str(port),
+                }
+            },
+        )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # REGION
+    # -----------------------------------------
+
+    region_ok = False
+
+    try:
+        region_mutation = """
+        mutation ServiceInstanceUpdate(
+            $input: ServiceInstanceUpdateInput!
+        ) {
+            serviceInstanceUpdate(input: $input)
+        }
+        """
+
+        _, err = railway_request(
+            token,
+            region_mutation,
+            {
+                "input": {
+                    "serviceId": service_id,
+                    "environmentId": env_id,
+                    "multiRegionConfig": {
+                        REGION: 1
+                    },
+                }
+            },
+        )
+
+        if not err:
+            region_ok = True
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # DOMAIN
+    # -----------------------------------------
+
+    domain_mutation = """
+    mutation ServiceDomainCreate(
+        $input: ServiceDomainCreateInput!
+    ) {
+        serviceDomainCreate(input: $input) {
+            domain {
+                id
+                domain
+            }
+        }
+    }
+    """
+
+    data, error = railway_request(
+        token,
+        domain_mutation,
+        {
+            "input": {
+                "serviceId": service_id,
+                "environmentId": env_id,
+            }
+        },
+    )
+
+    http_domain = None
+
+    if not error:
+        try:
+            http_domain = data[
+                "serviceDomainCreate"
+            ]["domain"]["domain"]
+        except Exception:
+            pass
+
+    # -----------------------------------------
+    # DEPLOY
+    # -----------------------------------------
+
+    try:
+        deploy_mutation = """
+        mutation ServiceInstanceDeploy(
+            $serviceId: String!,
+            $environmentId: String!
+        ) {
+            serviceInstanceDeploy(
+                serviceId: $serviceId,
+                environmentId: $environmentId
+            )
+        }
+        """
+
+        railway_request(
+            token,
+            deploy_mutation,
+            {
+                "serviceId": service_id,
+                "environmentId": env_id,
+            },
+        )
+
+    except Exception:
+        pass
+
+    if http_domain:
+        http_url = (
+            http_domain
+            if http_domain.startswith("http")
+            else f"https://{http_domain}"
+        )
+    else:
+        http_url = None
 
     return {
-        "name": name,
-        "http": f"https://{d['domain']}",
-        "tcp": None,
+        "name": project_name,
+        "repo": repo,
+        "http": http_url,
         "port": port,
+        "region": REGION,
         "region_ok": region_ok,
         "project_id": project_id,
         "service_id": service_id,
         "env_id": env_id,
+        "tcps": [],
+        "created_at": int(time.time()),
     }
 
 
+# =========================================================
+# TCP
+# =========================================================
+
 def create_tcp(token, service_id, env_id, port):
-    t = gql(token, """
-        mutation($s:String!, $e:String!, $port:Int!){
-          tcpProxyCreate(input:{serviceId:$s, environmentId:$e,
-                                applicationPort:$port}){
-            id domain proxyPort } }
-    """, {"s": service_id, "e": env_id, "port": port})["tcpProxyCreate"]
-    return f"{t['domain']}:{t['proxyPort']}"
+    mutation = """
+    mutation TcpProxyCreate(
+        $input: TCPProxyCreateInput!
+    ) {
+        tcpProxyCreate(input: $input) {
+            tcpProxy {
+                id
+                domain
+                proxyPort
+                applicationPort
+            }
+        }
+    }
+    """
+
+    data, error = railway_request(
+        token,
+        mutation,
+        {
+            "input": {
+                "serviceId": service_id,
+                "environmentId": env_id,
+                "applicationPort": int(port),
+            }
+        },
+    )
+
+    if error:
+        raise Exception(
+            error[0].get(
+                "message",
+                "خطا در ساخت TCP"
+            )
+        )
+
+    tcp = data["tcpProxyCreate"]["tcpProxy"]
+
+    return {
+        "id": tcp.get("id"),
+        "domain": tcp.get("domain"),
+        "proxy_port": tcp.get("proxyPort"),
+        "application_port": tcp.get("applicationPort"),
+        "address": (
+            f'{tcp.get("domain")}:{tcp.get("proxyPort")}'
+        ),
+    }
 
 
-def delete_tcp(token, service_id, env_id):
-    """همه TCP Proxy های سرویس رو حذف می‌کنه و تعدادشون رو برمی‌گردونه."""
-    proxies = gql(token, """
-        query($s:String!, $e:String!){
-          tcpProxies(serviceId:$s, environmentId:$e){
-            id domain proxyPort applicationPort } }
-    """, {"s": service_id, "e": env_id})["tcpProxies"]
-    for p in proxies:
-        gql(token, """
-            mutation($id:String!){ tcpProxyDelete(id:$id) }
-        """, {"id": p["id"]})
-    return len(proxies)
+def get_tcps(token, service_id, env_id):
+    query = """
+    query TcpProxies(
+        $serviceId: String!,
+        $environmentId: String!
+    ) {
+        tcpProxies(
+            serviceId: $serviceId,
+            environmentId: $environmentId
+        ) {
+            id
+            domain
+            proxyPort
+            applicationPort
+        }
+    }
+    """
 
+    data, error = railway_request(
+        token,
+        query,
+        {
+            "serviceId": service_id,
+            "environmentId": env_id,
+        },
+    )
+
+    if error:
+        return []
+
+    result = []
+
+    for tcp in data.get("tcpProxies", []):
+        result.append({
+            "id": tcp.get("id"),
+            "domain": tcp.get("domain"),
+            "proxy_port": tcp.get("proxyPort"),
+            "application_port": tcp.get("applicationPort"),
+            "address": (
+                f'{tcp.get("domain")}:{tcp.get("proxyPort")}'
+            ),
+        })
+
+    return result
+
+
+def delete_tcp_by_id(token, tcp_id):
+    mutation = """
+    mutation TcpProxyDelete($id: String!) {
+        tcpProxyDelete(id: $id)
+    }
+    """
+
+    data, error = railway_request(
+        token,
+        mutation,
+        {
+            "id": tcp_id,
+        },
+    )
+
+    if error:
+        raise Exception(
+            error[0].get(
+                "message",
+                "خطا در حذف TCP"
+            )
+        )
+
+    return True
+
+
+# =========================================================
+# DELETE PROJECT
+# =========================================================
 
 def delete_project(token, project_id):
-    gql(token, """
-        mutation($id:String!){ projectDelete(id:$id) }
-    """, {"id": project_id})
+    mutation = """
+    mutation ProjectDelete($id: String!) {
+        projectDelete(id: $id)
+    }
+    """
+
+    data, error = railway_request(
+        token,
+        mutation,
+        {
+            "id": project_id,
+        },
+    )
+
+    if error:
+        raise Exception(
+            error[0].get(
+                "message",
+                "خطا در حذف پنل"
+            )
+        )
+
+    return True
 
 
-# ---------------------------------------------------------------
-# اعتبارسنجی ورودی‌ها
-# ---------------------------------------------------------------
-def valid_repo(text):
-    m = re.match(r"^(?:https?://github\.com/)?([\w.-]+/[\w.-]+?)(?:\.git)?/?$",
-                 text.strip())
-    return m.group(1) if m else None
+# =========================================================
+# UI
+# =========================================================
+
+def main_menu(user_data):
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "🚀 ساخت پنل جدید",
+                callback_data="new",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 مدیریت پنل‌ها",
+                callback_data="panels",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔑 مدیریت توکن‌ها",
+                callback_data="tokens",
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(buttons)
 
 
-def valid_port(text):
-    text = text.strip()
-    if not text.isdigit():
-        return None
-    p = int(text)
-    return p if 1 <= p <= 65535 else None
+def tokens_keyboard(user_data):
+    tokens = get_tokens(user_data)
 
+    buttons = []
 
-def parse_idx(data):
-    try:
-        return int(data.rsplit("_", 1)[1])
-    except Exception:
-        return -1
+    for token_id, item in tokens.items():
+        active = (
+            "🟢 "
+            if token_id == user_data.get("active_token_id")
+            else ""
+        )
 
+        buttons.append([
+            InlineKeyboardButton(
+                f"{active}{item.get('name', 'توکن')}",
+                callback_data=f"token_select_{token_id}",
+            ),
+            InlineKeyboardButton(
+                "🗑",
+                callback_data=f"token_delete_{token_id}",
+            ),
+        ])
 
-# ---------------------------------------------------------------
-# کیبوردهای شیشه‌ای
-# ---------------------------------------------------------------
-def B(text, data):
-    return InlineKeyboardButton(text, callback_data=data)
-
-
-def main_kb(uid):
-    if not get_token(uid):
-        return InlineKeyboardMarkup([[B("🔑 ثبت توکن Railway", "set_token")]])
-    return InlineKeyboardMarkup([
-        [B("🚀 ساخت پنل جدید", "new")],
-        [B("📋 مدیریت پنل‌ها", "panels")],
-        [B("🚪 خروج (پاک کردن توکن)", "logout")],
+    buttons.append([
+        InlineKeyboardButton(
+            "➕ ثبت توکن جدید",
+            callback_data="token_add",
+        )
     ])
 
-
-def panels_kb(panels):
-    rows = [[B(f"📦 {p.get('name', 'پنل')}", f"p_{i}")] for i, p in enumerate(panels)]
-    rows.append([B("🔙 بازگشت", "home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def panel_kb(i, p):
-    if p.get("tcp"):
-        tcp_btn = B("🗑 حذف TCP", f"tcpdel_{i}")
-    else:
-        tcp_btn = B("➕ ساخت TCP", f"tcpadd_{i}")
-    return InlineKeyboardMarkup([
-        [tcp_btn],
-        [B("🗑 حذف پنل", f"pdel_{i}")],
-        [B("🔙 لیست پنل‌ها", "panels")],
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 بازگشت",
+            callback_data="home",
+        )
     ])
 
-
-def confirm_kb(ok_data, back_data):
-    return InlineKeyboardMarkup([[B("✅ بله", ok_data), B("❌ لغو", back_data)]])
+    return InlineKeyboardMarkup(buttons)
 
 
-def panel_text(p):
-    return (f"📦 {p.get('name', 'پنل')}\n\n"
-            f"🌐 HTTP: {p.get('http', '-')}\n"
-            f"🚪 پورت پنل: {p.get('port', '-')}\n"
-            f"🔌 TCP: {p.get('tcp') or 'ندارد'}\n"
-            + ("📍 ریجن: هلند (آمستردام)" if p.get("region_ok", True)
-               else "⚠️ ریجن هلند ست نشد (پیش‌فرض اکانت استفاده می‌شه)"))
+def panels_keyboard(user_data):
+    panels = get_panels(user_data)
 
+    buttons = []
 
-# ---------------------------------------------------------------
-# هندلرها
-# ---------------------------------------------------------------
-async def ask_token(target, ctx, after):
-    """از کاربر توکن می‌خواد. after = 'repo' یا 'menu' (بعد از ثبت توکن چی بشه)."""
-    ctx.user_data["waiting"] = "token"
-    ctx.user_data["after_token"] = after
-    text = ("🔑 اول توکن Railway خودت رو بفرست (Account Token):\n"
-            "Railway ← Account Settings ← Tokens")
-    if hasattr(target, "edit_message_text"):
-        await target.edit_message_text(text)
-    else:
-        await target.reply_text(text)
+    if not panels:
+        buttons.append([
+            InlineKeyboardButton(
+                "📭 هیچ پنلی ثبت نشده",
+                callback_data="noop",
+            )
+        ])
 
+    for i, panel in enumerate(panels):
+        normalize_panel(panel)
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ctx.user_data["waiting"] = None
-    if not get_token(uid):
-        has_panels = bool(ctx.user_data.get("panels"))
-        await update.message.reply_text("به ربات پنل‌ساز خوش اومدی 👋")
-        await ask_token(update.message, ctx, "menu" if has_panels else "repo")
-    else:
-        await update.message.reply_text("منوی اصلی 👇", reply_markup=main_kb(uid))
+        tcps = panel.get("tcps", [])
 
+        buttons.append([
+            InlineKeyboardButton(
+                f"📦 {panel.get('name', f'Panel {i+1}')}",
+                callback_data=f"p_{i}",
+            )
+        ])
 
-async def buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    d = q.data
-    panels = ctx.user_data.setdefault("panels", [])
+        # TCP buttons directly inside panel management
+        tcp_buttons = [
+            InlineKeyboardButton(
+                f"➕ TCP ({len(tcps)}/{MAX_TCPS})",
+                callback_data=f"tcpadd_{i}",
+            ),
+            InlineKeyboardButton(
+                "🛠 مدیریت TCP",
+                callback_data=f"tcpmanage_{i}",
+            ),
+        ]
 
-    async def need_token():
-        """اگه توکن نیست از کاربر می‌خواد و None برمی‌گردونه."""
-        t = get_token(uid)
-        if not t:
-            await ask_token(q, ctx, "menu")
-        return t
-
-    if d == "set_token":
-        await ask_token(q, ctx, "repo")
-
-    elif d == "home":
-        ctx.user_data["waiting"] = None
-        await q.edit_message_text("منوی اصلی 👇", reply_markup=main_kb(uid))
-
-    elif d == "logout":
-        TOKENS.pop(uid, None)
-        await q.edit_message_text("🚪 توکن از حافظه پاک شد.\n"
-                                  "یادت نره توکن رو از Railway هم حذف کنی.",
-                                  reply_markup=main_kb(uid))
-
-    elif d == "new":
-        if not await need_token():
-            return
-        ctx.user_data["waiting"] = "repo"
-        await q.edit_message_text("📦 لینک ریپوی گیت‌هاب رو بفرست (یا user/repo):")
-
-    elif d == "panels":
-        if not panels:
-            await q.edit_message_text("هنوز پنلی نساختی.", reply_markup=main_kb(uid))
+        if len(tcps) < MAX_TCPS:
+            buttons.append(tcp_buttons)
         else:
-            await q.edit_message_text("📋 پنل‌های تو:", reply_markup=panels_kb(panels))
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🔌 TCP کامل شد ({len(tcps)}/{MAX_TCPS})",
+                    callback_data=f"tcpmanage_{i}",
+                )
+            ])
 
-    elif d.startswith("p_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
-            await q.edit_message_text("❌ پیدا نشد.", reply_markup=main_kb(uid))
-            return
-        await q.edit_message_text(panel_text(panels[i]),
-                                  reply_markup=panel_kb(i, panels[i]))
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 بازگشت",
+            callback_data="home",
+        )
+    ])
 
-    elif d.startswith("tcpadd_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
-            return
-        if not await need_token():
-            return
-        ctx.user_data["waiting"] = "port"
-        ctx.user_data["port_for"] = i
-        await q.edit_message_text(
-            "🔌 پورت TCP رو بفرست (عدد بین 1 تا 65535).\n"
-            "باید همون پورتی باشه که پنل داخل کانتینر روش گوش می‌ده.")
+    return InlineKeyboardMarkup(buttons)
 
-    elif d.startswith("tcpdel_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
-            return
-        await q.edit_message_text(
-            f"مطمئنی TCP حذف بشه؟\n\n🔌 {panels[i].get('tcp')}",
-            reply_markup=confirm_kb(f"oktcpdel_{i}", f"p_{i}"))
 
-    elif d.startswith("oktcpdel_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
+def panel_text(panel):
+    normalize_panel(panel)
+
+    tcps = panel.get("tcps", [])
+
+    text = (
+        f"📦 <b>{panel.get('name', 'Panel')}</b>\n\n"
+        f"🌐 HTTP: "
+        f"{panel.get('http') or 'ندارد'}\n\n"
+        f"📁 Repo: "
+        f"{panel.get('repo', '-')}\n\n"
+        f"⚙️ Port: "
+        f"{panel.get('port', '-')}\n\n"
+        f"🌍 Region: "
+        f"{panel.get('region', '-')}\n\n"
+        f"🔌 TCP: {len(tcps)}/{MAX_TCPS}\n"
+    )
+
+    for i, tcp in enumerate(tcps, 1):
+        text += (
+            f"\n🔹 TCP {i}: "
+            f"<code>{tcp.get('address', '-')}</code>"
+        )
+
+    return text
+
+
+def panel_keyboard(index, panel):
+    normalize_panel(panel)
+
+    tcps = panel.get("tcps", [])
+
+    buttons = []
+
+    if len(tcps) < MAX_TCPS:
+        buttons.append([
+            InlineKeyboardButton(
+                f"➕ ساخت TCP ({len(tcps)}/{MAX_TCPS})",
+                callback_data=f"tcpadd_{index}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🛠 مدیریت TCP",
+            callback_data=f"tcpmanage_{index}",
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🗑 حذف پنل",
+            callback_data=f"pdel_{index}",
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 همه پنل‌ها",
+            callback_data="panels",
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def tcp_manage_keyboard(panel_index, panel):
+    normalize_panel(panel)
+
+    tcps = panel.get("tcps", [])
+
+    buttons = []
+
+    for i, tcp in enumerate(tcps):
+        buttons.append([
+            InlineKeyboardButton(
+                f"🔌 TCP {i+1}",
+                callback_data=f"tcpinfo_{panel_index}_{i}",
+            ),
+            InlineKeyboardButton(
+                "🗑 حذف",
+                callback_data=f"tcpdel_{panel_index}_{i}",
+            ),
+        ])
+
+    if len(tcps) < MAX_TCPS:
+        buttons.append([
+            InlineKeyboardButton(
+                f"➕ ساخت TCP ({len(tcps)}/{MAX_TCPS})",
+                callback_data=f"tcpadd_{panel_index}",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🔙 پنل",
+            callback_data=f"p_{panel_index}",
+        )
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data = context.user_data
+
+    if not get_active_token(user_data):
+        text = (
+            "👋 سلام!\n\n"
+            "برای شروع ابتدا یک توکن Railway ثبت کن."
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔑 ثبت توکن Railway",
+                    callback_data="token_add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 مدیریت پنل‌ها",
+                    callback_data="panels",
+                )
+            ],
+        ])
+
+        await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+        )
+
+        return
+
+    await update.message.reply_text(
+        "🏠 منوی اصلی",
+        reply_markup=main_menu(user_data),
+    )
+
+
+# =========================================================
+# CALLBACKS
+# =========================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    await query.answer()
+
+    user_data = context.user_data
+
+    data = query.data
+
+    # -----------------------------------------
+    # NOOP
+    # -----------------------------------------
+
+    if data == "noop":
+        return
+
+    # -----------------------------------------
+    # HOME
+    # -----------------------------------------
+
+    if data == "home":
+        await query.edit_message_text(
+            "🏠 منوی اصلی",
+            reply_markup=main_menu(user_data),
+        )
+        return
+
+    # -----------------------------------------
+    # TOKENS
+    # -----------------------------------------
+
+    if data == "tokens":
+        tokens = get_tokens(user_data)
+
+        text = (
+            "🔑 <b>مدیریت توکن‌های Railway</b>\n\n"
+            f"تعداد توکن‌ها: {len(tokens)}\n\n"
+            "🟢 توکن فعال برای ساخت پنل جدید استفاده می‌شود."
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=tokens_keyboard(user_data),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if data == "token_add":
+        user_data["waiting"] = "token"
+
+        await query.edit_message_text(
+            "🔑 توکن Railway را ارسال کن:\n\n"
+            "توکن به صورت دائمی در اطلاعات ربات ذخیره می‌شود."
+        )
+
+        return
+
+    if data.startswith("token_select_"):
+        token_id = data.replace("token_select_", "", 1)
+
+        if token_id not in get_tokens(user_data):
+            await query.answer(
+                "این توکن پیدا نشد.",
+                show_alert=True,
+            )
             return
-        token = await need_token()
-        if not token:
+
+        user_data["active_token_id"] = token_id
+
+        await query.edit_message_text(
+            "✅ توکن فعال تغییر کرد.",
+            reply_markup=tokens_keyboard(user_data),
+        )
+
+        return
+
+    if data.startswith("token_delete_"):
+        token_id = data.replace("token_delete_", "", 1)
+
+        if token_id not in get_tokens(user_data):
             return
-        p = panels[i]
-        await q.edit_message_text("⏳ در حال حذف TCP...")
+
+        user_data["delete_token_id"] = token_id
+
+        await query.edit_message_text(
+            "⚠️ مطمئنی می‌خواهی این توکن حذف شود؟\n\n"
+            "پنل‌هایی که قبلاً با این توکن ساخته شده‌اند "
+            "در اطلاعات ربات باقی می‌مانند، ولی برای مدیریت "
+            "آن‌ها دوباره باید همین توکن را اضافه کنی.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ بله، حذف کن",
+                        callback_data="token_delete_confirm",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ لغو",
+                        callback_data="tokens",
+                    ),
+                ]
+            ]),
+        )
+
+        return
+
+    if data == "token_delete_confirm":
+        token_id = user_data.pop(
+            "delete_token_id",
+            None,
+        )
+
+        if token_id:
+            delete_token(
+                user_data,
+                token_id,
+            )
+
+        await query.edit_message_text(
+            "✅ توکن حذف شد.",
+            reply_markup=tokens_keyboard(user_data),
+        )
+
+        return
+
+    # -----------------------------------------
+    # NEW PANEL
+    # -----------------------------------------
+
+    if data == "new":
+        if not get_active_token(user_data):
+            await query.edit_message_text(
+                "❌ ابتدا یک توکن Railway ثبت کن.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔑 ثبت توکن",
+                            callback_data="token_add",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔙 بازگشت",
+                            callback_data="home",
+                        )
+                    ],
+                ]),
+            )
+            return
+
+        user_data["waiting"] = "repo"
+
+        await query.edit_message_text(
+            "🚀 آدرس GitHub Repository را ارسال کن.\n\n"
+            "مثال:\n"
+            "<code>username/repository</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # PANELS
+    # -----------------------------------------
+
+    if data == "panels":
+        panels = get_panels(user_data)
+
+        if not panels:
+            await query.edit_message_text(
+                "📭 هنوز هیچ پنلی ساخته نشده.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🚀 ساخت پنل جدید",
+                            callback_data="new",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔙 بازگشت",
+                            callback_data="home",
+                        )
+                    ],
+                ]),
+            )
+            return
+
+        await query.edit_message_text(
+            f"📋 <b>مدیریت پنل‌ها</b>\n\n"
+            f"تعداد پنل‌ها: {len(panels)}\n\n"
+            f"از همین‌جا برای هر پنل می‌توانی TCP بسازی.",
+            reply_markup=panels_keyboard(user_data),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # PANEL
+    # -----------------------------------------
+
+    if data.startswith("p_"):
         try:
-            n = await asyncio.to_thread(delete_tcp, token, p["service_id"], p["env_id"])
-            p["tcp"] = None
-            await q.edit_message_text(f"✅ {n} تا TCP حذف شد.\n\n" + panel_text(p),
-                                      reply_markup=panel_kb(i, p))
-        except Exception as e:
-            await q.edit_message_text(f"❌ خطا: {e}", reply_markup=panel_kb(i, p))
+            index = int(data.split("_")[1])
+        except Exception:
+            return
 
-    elif d.startswith("pdel_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
-            return
-        await q.edit_message_text(
-            f"⚠️ کل پروژه «{panels[i].get('name', 'پنل')}» از Railway حذف می‌شه "
-            f"(سرویس، دامنه و TCP). مطمئنی؟",
-            reply_markup=confirm_kb(f"okpdel_{i}", f"p_{i}"))
+        panels = get_panels(user_data)
 
-    elif d.startswith("okpdel_"):
-        i = parse_idx(d)
-        if not 0 <= i < len(panels):
+        if index >= len(panels):
             return
-        token = await need_token()
-        if not token:
-            return
-        p = panels[i]
-        if not p.get("project_id"):
-            await q.edit_message_text("❌ شناسه پروژه ذخیره نشده. از داشبورد Railway حذفش کن.",
-                                      reply_markup=main_kb(uid))
-            return
-        await q.edit_message_text("⏳ در حال حذف پنل...")
+
+        panel = panels[index]
+
+        await query.edit_message_text(
+            panel_text(panel),
+            reply_markup=panel_keyboard(
+                index,
+                panel,
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # TCP ADD
+    # -----------------------------------------
+
+    if data.startswith("tcpadd_"):
         try:
-            await asyncio.to_thread(delete_project, token, p["project_id"])
-            panels.pop(i)
-            await q.edit_message_text("✅ پنل حذف شد.", reply_markup=main_kb(uid))
+            index = int(data.split("_")[1])
+        except Exception:
+            return
+
+        panels = get_panels(user_data)
+
+        if index >= len(panels):
+            return
+
+        panel = panels[index]
+
+        normalize_panel(panel)
+
+        tcps = panel["tcps"]
+
+        if len(tcps) >= MAX_TCPS:
+            await query.answer(
+                "❌ این پنل قبلاً ۳ TCP دارد.",
+                show_alert=True,
+            )
+            return
+
+        token = get_token_for_panel(
+            user_data,
+            panel,
+        )
+
+        if not token:
+            await query.edit_message_text(
+                "❌ توکن Railway مربوط به این پنل در ربات وجود ندارد.\n\n"
+                "لطفاً همان توکن را دوباره ثبت کن.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔑 ثبت توکن",
+                            callback_data="token_add",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔙 مدیریت پنل‌ها",
+                            callback_data="panels",
+                        )
+                    ],
+                ]),
+            )
+            return
+
+        user_data["waiting"] = "tcp_port"
+        user_data["tcp_panel_index"] = index
+
+        await query.edit_message_text(
+            f"🔌 ساخت TCP جدید\n\n"
+            f"TCP فعلی: {len(tcps)}/{MAX_TCPS}\n\n"
+            f"پورت Application را ارسال کن.\n\n"
+            f"مثال: <code>443</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # TCP MANAGE
+    # -----------------------------------------
+
+    if data.startswith("tcpmanage_"):
+        try:
+            index = int(data.split("_")[1])
+        except Exception:
+            return
+
+        panels = get_panels(user_data)
+
+        if index >= len(panels):
+            return
+
+        panel = panels[index]
+
+        normalize_panel(panel)
+
+        await query.edit_message_text(
+            f"🛠 <b>مدیریت TCP</b>\n\n"
+            f"پنل: <b>{panel.get('name', 'Panel')}</b>\n"
+            f"تعداد TCP: {len(panel['tcps'])}/{MAX_TCPS}",
+            reply_markup=tcp_manage_keyboard(
+                index,
+                panel,
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # TCP INFO
+    # -----------------------------------------
+
+    if data.startswith("tcpinfo_"):
+        parts = data.split("_")
+
+        try:
+            panel_index = int(parts[1])
+            tcp_index = int(parts[2])
+        except Exception:
+            return
+
+        panels = get_panels(user_data)
+
+        if panel_index >= len(panels):
+            return
+
+        panel = panels[panel_index]
+
+        normalize_panel(panel)
+
+        tcps = panel["tcps"]
+
+        if tcp_index >= len(tcps):
+            return
+
+        tcp = tcps[tcp_index]
+
+        text = (
+            f"🔌 <b>TCP {tcp_index + 1}</b>\n\n"
+            f"🌐 Address:\n"
+            f"<code>{tcp.get('address', '-')}</code>\n\n"
+            f"📥 Application Port: "
+            f"{tcp.get('application_port', '-')}\n\n"
+            f"📤 Proxy Port: "
+            f"{tcp.get('proxy_port', '-')}"
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🗑 حذف TCP",
+                        callback_data=(
+                            f"tcpdel_{panel_index}_{tcp_index}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 مدیریت TCP",
+                        callback_data=f"tcpmanage_{panel_index}",
+                    )
+                ],
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # TCP DELETE
+    # -----------------------------------------
+
+    if data.startswith("tcpdel_"):
+        parts = data.split("_")
+
+        try:
+            panel_index = int(parts[1])
+            tcp_index = int(parts[2])
+        except Exception:
+            return
+
+        panels = get_panels(user_data)
+
+        if panel_index >= len(panels):
+            return
+
+        panel = panels[panel_index]
+
+        normalize_panel(panel)
+
+        tcps = panel["tcps"]
+
+        if tcp_index >= len(tcps):
+            return
+
+        user_data["delete_tcp_panel"] = panel_index
+        user_data["delete_tcp_index"] = tcp_index
+
+        await query.edit_message_text(
+            f"⚠️ حذف TCP {tcp_index + 1}؟\n\n"
+            f"<code>{tcps[tcp_index].get('address', '-')}</code>",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ حذف",
+                        callback_data="tcpdel_confirm",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ لغو",
+                        callback_data=(
+                            f"tcpmanage_{panel_index}"
+                        ),
+                    ),
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if data == "tcpdel_confirm":
+        panel_index = user_data.pop(
+            "delete_tcp_panel",
+            None,
+        )
+
+        tcp_index = user_data.pop(
+            "delete_tcp_index",
+            None,
+        )
+
+        if panel_index is None or tcp_index is None:
+            return
+
+        panels = get_panels(user_data)
+
+        if panel_index >= len(panels):
+            return
+
+        panel = panels[panel_index]
+
+        normalize_panel(panel)
+
+        tcps = panel["tcps"]
+
+        if tcp_index >= len(tcps):
+            return
+
+        tcp = tcps[tcp_index]
+
+        token = get_token_for_panel(
+            user_data,
+            panel,
+        )
+
+        if not token:
+            await query.edit_message_text(
+                "❌ توکن مربوط به این پنل پیدا نشد.\n\n"
+                "ابتدا توکن مربوط به پنل را دوباره ثبت کن.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔑 ثبت توکن",
+                            callback_data="token_add",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🔙 مدیریت پنل‌ها",
+                            callback_data="panels",
+                        )
+                    ],
+                ]),
+            )
+            return
+
+        try:
+            if tcp.get("id"):
+                delete_tcp_by_id(
+                    token,
+                    tcp["id"],
+                )
+
         except Exception as e:
-            await q.edit_message_text(f"❌ خطا: {e}", reply_markup=panel_kb(i, p))
+            await query.edit_message_text(
+                f"❌ خطا در حذف TCP:\n\n{e}",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🔙 مدیریت TCP",
+                            callback_data=(
+                                f"tcpmanage_{panel_index}"
+                            ),
+                        )
+                    ]
+                ]),
+            )
+            return
+
+        tcps.pop(tcp_index)
+
+        await query.edit_message_text(
+            "✅ TCP حذف شد.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🛠 مدیریت TCP",
+                        callback_data=(
+                            f"tcpmanage_{panel_index}"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📋 همه پنل‌ها",
+                        callback_data="panels",
+                    )
+                ],
+            ]),
+        )
+
+        return
+
+    # -----------------------------------------
+    # PANEL DELETE
+    # -----------------------------------------
+
+    if data.startswith("pdel_"):
+        try:
+            index = int(data.split("_")[1])
+        except Exception:
+            return
+
+        panels = get_panels(user_data)
+
+        if index >= len(panels):
+            return
+
+        user_data["delete_panel_index"] = index
+
+        await query.edit_message_text(
+            "⚠️ مطمئنی می‌خواهی این پنل را حذف کنی؟",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ بله، حذف کن",
+                        callback_data="pdel_confirm",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ لغو",
+                        callback_data=f"p_{index}",
+                    ),
+                ]
+            ]),
+        )
+
+        return
+
+    if data == "pdel_confirm":
+        index = user_data.pop(
+            "delete_panel_index",
+            None,
+        )
+
+        if index is None:
+            return
+
+        panels = get_panels(user_data)
+
+        if index >= len(panels):
+            return
+
+        panel = panels[index]
+
+        token = get_token_for_panel(
+            user_data,
+            panel,
+        )
+
+        if token:
+            try:
+                delete_project(
+                    token,
+                    panel["project_id"],
+                )
+            except Exception:
+                pass
+
+        panels.pop(index)
+
+        await query.edit_message_text(
+            "✅ پنل حذف شد.",
+            reply_markup=panels_keyboard(user_data),
+        )
+
+        return
 
 
-async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    waiting = ctx.user_data.get("waiting")
+# =========================================================
+# TEXT HANDLER
+# =========================================================
+
+async def text_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_data = context.user_data
+
+    waiting = user_data.get("waiting")
+
     text = update.message.text.strip()
-    panels = ctx.user_data.setdefault("panels", [])
+
+    # -----------------------------------------
+    # TOKEN
+    # -----------------------------------------
 
     if waiting == "token":
-        set_token(uid, text)
-        ctx.user_data["waiting"] = None
+        token = text
+
+        if len(token) < 10:
+            await update.message.reply_text(
+                "❌ توکن واردشده خیلی کوتاه است."
+            )
+            return
+
+        # Validate token
+        workspace_id = get_workspace_id(token)
+
+        if not workspace_id:
+            await update.message.reply_text(
+                "❌ توکن Railway معتبر نیست.\n"
+                "یک توکن صحیح ارسال کن."
+            )
+            return
+
+        token_id = add_token(
+            user_data,
+            token,
+        )
+
+        user_data.pop("waiting", None)
+
+        await update.message.reply_text(
+            "✅ توکن Railway با موفقیت ثبت شد.\n\n"
+            "این توکن به عنوان توکن فعال انتخاب شد.",
+            reply_markup=main_menu(user_data),
+        )
+
+        return
+
+    # -----------------------------------------
+    # REPO
+    # -----------------------------------------
+
+    if waiting == "repo":
+        repo = text
+
+        repo = repo.replace(
+            "https://github.com/",
+            "",
+        ).strip("/")
+
+        if not re.match(
+            r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+            repo,
+        ):
+            await update.message.reply_text(
+                "❌ فرمت Repository صحیح نیست.\n\n"
+                "مثال:\n"
+                "username/repository"
+            )
+            return
+
+        if not get_active_token(user_data):
+            await update.message.reply_text(
+                "❌ ابتدا یک توکن Railway ثبت کن."
+            )
+            return
+
+        user_data["pending_repo"] = repo
+        user_data["waiting"] = "deploy_port"
+
+        await update.message.reply_text(
+            "📡 پورت برنامه را ارسال کن.\n\n"
+            "مثال:\n"
+            "<code>8080</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # -----------------------------------------
+    # DEPLOY PORT
+    # -----------------------------------------
+
+    if waiting == "deploy_port":
         try:
-            await update.message.delete()  # پاک کردن پیام حاوی توکن
+            port = int(text)
+
+            if port < 1 or port > 65535:
+                raise ValueError
+
         except Exception:
-            pass
-        if ctx.user_data.get("after_token") == "repo":
-            ctx.user_data["waiting"] = "repo"
-            await update.effective_chat.send_message(
-                "✅ توکن ثبت شد.\n\n📦 حالا لینک ریپوی گیت‌هاب رو بفرست (یا user/repo):")
-        else:
-            await update.effective_chat.send_message(
-                "✅ توکن ثبت شد.", reply_markup=main_kb(uid))
+            await update.message.reply_text(
+                "❌ پورت باید عددی بین 1 تا 65535 باشد."
+            )
+            return
 
-    elif waiting == "repo":
-        repo = valid_repo(text)
-        if not repo:
-            await update.message.reply_text("❌ فرمت اشتباهه. مثال: user/repo")
-            return
-        if not get_token(uid):
-            await ask_token(update.message, ctx, "repo")
-            return
-        ctx.user_data["pending_repo"] = repo
-        ctx.user_data["waiting"] = "deploy_port"
-        await update.effective_chat.send_message(
-            "🚪 پورت پنل رو بفرست (عدد بین 1 تا 65535).\n"
-            "باید همون پورتی باشه که پنل داخل کانتینر روش گوش می‌ده.")
+        repo = user_data.pop(
+            "pending_repo",
+            None,
+        )
 
-    elif waiting == "deploy_port":
-        port = valid_port(text)
-        if not port:
-            await update.message.reply_text("❌ پورت نامعتبره. یه عدد بین 1 تا 65535 بفرست.")
+        token = get_active_token(user_data)
+
+        token_id = get_active_token_id(user_data)
+
+        if not repo or not token or not token_id:
+            await update.message.reply_text(
+                "❌ اطلاعات ساخت پنل ناقص است."
+            )
+            user_data.pop("waiting", None)
             return
-        token = get_token(uid)
-        repo = ctx.user_data.get("pending_repo")
-        if not token or not repo:
-            ctx.user_data["waiting"] = None
-            await ask_token(update.message, ctx, "repo")
-            return
-        ctx.user_data["waiting"] = None
-        ctx.user_data.pop("pending_repo", None)
-        msg = await update.effective_chat.send_message("⏳ در حال دیپلوی روی اکانت تو...")
+
+        await update.message.reply_text(
+            "⏳ در حال ساخت پنل روی Railway..."
+        )
+
         try:
-            p = await asyncio.to_thread(deploy_panel, token, repo, port)
-            panels.append(p)
-            i = len(panels) - 1
-            await msg.edit_text(
-                "✅ پنل ساخته شد. چند دقیقه صبر کن تا بیلد تموم شه.\n\n" + panel_text(p),
-                reply_markup=panel_kb(i, p))
-        except Exception as e:
-            await msg.edit_text(f"❌ خطا: {e}", reply_markup=main_kb(uid))
+            panel = await asyncio.to_thread(
+                deploy_panel,
+                token,
+                repo,
+                port,
+            )
 
-    elif waiting == "port":
-        port = valid_port(text)
-        if not port:
-            await update.message.reply_text("❌ پورت نامعتبره. یه عدد بین 1 تا 65535 بفرست.")
+            panel["token_id"] = token_id
+
+            panels = get_panels(user_data)
+
+            panels.append(panel)
+
+            user_data.pop("waiting", None)
+
+            index = len(panels) - 1
+
+            await update.message.reply_text(
+                "✅ پنل با موفقیت ساخته شد!\n\n"
+                + panel_text(panel),
+                reply_markup=panel_keyboard(
+                    index,
+                    panel,
+                ),
+                parse_mode="HTML",
+            )
+
+        except Exception as e:
+            user_data.pop("waiting", None)
+
+            await update.message.reply_text(
+                f"❌ خطا در ساخت پنل:\n\n"
+                f"<code>{str(e)}</code>",
+                parse_mode="HTML",
+                reply_markup=main_menu(user_data),
+            )
+
+        return
+
+    # -----------------------------------------
+    # TCP PORT
+    # -----------------------------------------
+
+    if waiting == "tcp_port":
+        try:
+            port = int(text)
+
+            if port < 1 or port > 65535:
+                raise ValueError
+
+        except Exception:
+            await update.message.reply_text(
+                "❌ پورت باید عددی بین 1 تا 65535 باشد."
+            )
             return
-        i = ctx.user_data.get("port_for", -1)
-        token = get_token(uid)
+
+        panel_index = user_data.pop(
+            "tcp_panel_index",
+            None,
+        )
+
+        user_data.pop("waiting", None)
+
+        if panel_index is None:
+            await update.message.reply_text(
+                "❌ پنل پیدا نشد."
+            )
+            return
+
+        panels = get_panels(user_data)
+
+        if panel_index >= len(panels):
+            await update.message.reply_text(
+                "❌ پنل پیدا نشد."
+            )
+            return
+
+        panel = panels[panel_index]
+
+        normalize_panel(panel)
+
+        if len(panel["tcps"]) >= MAX_TCPS:
+            await update.message.reply_text(
+                "❌ این پنل قبلاً ۳ TCP دارد."
+            )
+            return
+
+        token = get_token_for_panel(
+            user_data,
+            panel,
+        )
+
         if not token:
-            await ask_token(update.message, ctx, "menu")
+            await update.message.reply_text(
+                "❌ توکن Railway مربوط به این پنل پیدا نشد."
+            )
             return
-        if not 0 <= i < len(panels):
-            ctx.user_data["waiting"] = None
-            await update.message.reply_text("❌ پنل پیدا نشد.", reply_markup=main_kb(uid))
-            return
-        ctx.user_data["waiting"] = None
-        p = panels[i]
-        msg = await update.effective_chat.send_message("⏳ در حال ساخت TCP...")
-        try:
-            p["tcp"] = await asyncio.to_thread(
-                create_tcp, token, p["service_id"], p["env_id"], port)
-            await msg.edit_text("✅ TCP ساخته شد.\n\n" + panel_text(p),
-                                reply_markup=panel_kb(i, p))
-        except Exception as e:
-            await msg.edit_text(f"❌ خطا: {e}", reply_markup=panel_kb(i, p))
 
+        await update.message.reply_text(
+            "⏳ در حال ساخت TCP..."
+        )
+
+        try:
+            tcp = await asyncio.to_thread(
+                create_tcp,
+                token,
+                panel["service_id"],
+                panel["env_id"],
+                port,
+            )
+
+            panel["tcps"].append(tcp)
+
+            await update.message.reply_text(
+                f"✅ TCP با موفقیت ساخته شد!\n\n"
+                f"🔌 TCP "
+                f"{len(panel['tcps'])}/{MAX_TCPS}\n\n"
+                f"🌐 Address:\n"
+                f"<code>{tcp.get('address', '-')}</code>\n\n"
+                f"📥 Application Port: "
+                f"{tcp.get('application_port', '-')}\n\n"
+                f"📤 Proxy Port: "
+                f"{tcp.get('proxy_port', '-')}",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "➕ TCP دیگر",
+                            callback_data=(
+                                f"tcpadd_{panel_index}"
+                            ),
+                        )
+                    ]
+                    if len(panel["tcps"]) < MAX_TCPS
+                    else [
+                        InlineKeyboardButton(
+                            "🛠 مدیریت TCP",
+                            callback_data=(
+                                f"tcpmanage_{panel_index}"
+                            ),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 همه پنل‌ها",
+                            callback_data="panels",
+                        )
+                    ],
+                ]),
+                parse_mode="HTML",
+            )
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ خطا در ساخت TCP:\n\n"
+                f"<code>{str(e)}</code>",
+                parse_mode="HTML",
+            )
+
+        return
+
+    # -----------------------------------------
+    # DEFAULT
+    # -----------------------------------------
+
+    await update.message.reply_text(
+        "از منوی ربات استفاده کن.",
+        reply_markup=main_menu(user_data),
+    )
+
+
+# =========================================================
+# ERROR
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    print("BOT ERROR:", context.error)
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    persistence = PicklePersistence(filepath=DATA_FILE, update_interval=5)
-    app = (ApplicationBuilder()
-           .token(BOT_TOKEN)
-           .persistence(persistence)
-           .build())
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.run_polling()
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    os.makedirs(
+        DATA_DIR,
+        exist_ok=True,
+    )
+
+    persistence = PicklePersistence(
+        filepath=DATA_FILE,
+        update_interval=2,
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start,
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
+        )
+    )
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    print("Bot started...")
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":

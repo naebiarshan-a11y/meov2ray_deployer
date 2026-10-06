@@ -249,10 +249,8 @@ def deploy_panel(token, repo, port):
     project_mutation = """
     mutation ProjectCreate($input: ProjectCreateInput!) {
         projectCreate(input: $input) {
-            project {
-                id
-                name
-            }
+            id
+            name
         }
     }
     """
@@ -276,7 +274,7 @@ def deploy_panel(token, repo, port):
             )
         )
 
-    project = data["projectCreate"]["project"]
+    project = data["projectCreate"]
     project_id = project["id"]
 
     # Create service
@@ -318,14 +316,12 @@ def deploy_panel(token, repo, port):
 
     # Environment
     env_query = """
-    query Project($id: String!) {
-        project(id: $id) {
-            environments {
-                edges {
-                    node {
-                        id
-                        name
-                    }
+    query Environments($projectId: String!) {
+        environments(projectId: $projectId, isEphemeral: false) {
+            edges {
+                node {
+                    id
+                    name
                 }
             }
         }
@@ -335,7 +331,7 @@ def deploy_panel(token, repo, port):
     data, error = railway_request(
         token,
         env_query,
-        {"id": project_id},
+        {"projectId": project_id},
     )
 
     if error:
@@ -348,7 +344,7 @@ def deploy_panel(token, repo, port):
 
     try:
         env_id = (
-            data["project"]["environments"]["edges"][0]
+            data["environments"]["edges"][0]
             ["node"]["id"]
         )
     except Exception:

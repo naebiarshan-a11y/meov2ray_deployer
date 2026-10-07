@@ -452,27 +452,30 @@ def deploy_panel(token, repo, port):
     }
     """
 
-    _, variable_error = railway_request(
-        token,
-        variable_mutation,
-        {
-            "input": {
-                "projectId": project_id,
-                "environmentId": env_id,
-                "serviceId": service_id,
-                "name": "PORT",
-                "value": str(port),
-            }
-        },
-    )
-
-    if variable_error:
-        raise Exception(
-            variable_error[0].get(
-                "message",
-                "خطا در تنظیم PORT",
-            )
+    # Railway's PORT variable is useful for generic web services.
+    # 3x-ui itself reads XUI_PORT, so BOTH variables are set.
+    for variable_name in ("PORT", "XUI_PORT"):
+        _, variable_error = railway_request(
+            token,
+            variable_mutation,
+            {
+                "input": {
+                    "projectId": project_id,
+                    "environmentId": env_id,
+                    "serviceId": service_id,
+                    "name": variable_name,
+                    "value": str(port),
+                }
+            },
         )
+
+        if variable_error:
+            raise Exception(
+                variable_error[0].get(
+                    "message",
+                    f"خطا در تنظیم {variable_name}",
+                )
+            )
 
     # ---------------------------------------------------------
     # Region
@@ -556,8 +559,13 @@ def deploy_panel(token, repo, port):
             raise Exception("Railway Volume را ایجاد نکرد.")
 
     # ---------------------------------------------------------
-    # Railway public domain
+    # Public networking
     # ---------------------------------------------------------
+    # Railway supports a target port on a service domain. A service
+    # can have only one Railway-provided *.up.railway.app domain,
+    # so we use that domain for the 3x-ui panel (2053).
+    # For the separate subscription port (2096), create a TCP Proxy
+    # so Railway also gives us a public hostname/port for it.
     domain_mutation = """
     mutation ServiceDomainCreate(
         $input: ServiceDomainCreateInput!
@@ -576,6 +584,7 @@ def deploy_panel(token, repo, port):
             "input": {
                 "serviceId": service_id,
                 "environmentId": env_id,
+                "targetPort": int(port),
             }
         },
     )
@@ -587,6 +596,35 @@ def deploy_panel(token, repo, port):
             http_domain = data["serviceDomainCreate"]["domain"]
         except Exception:
             http_domain = None
+
+    # ---------------------------------------------------------
+    # Subscription public endpoint (3x-ui default: 2096)
+    # ---------------------------------------------------------
+    # 3x-ui v3.9.x uses subPort=2096 by default. Railway cannot
+    # generate a second *.up.railway.app HTTP domain for the same
+    # service, therefore expose 2096 through a TCP Proxy as well.
+    subscription_domain = None
+    subscription_proxy_port = None
+    subscription_address = None
+    subscription_error = None
+
+    if repo == MY_REPO:
+        try:
+            sub = create_tcp(
+                token,
+                service_id,
+                env_id,
+                2096,
+            )
+            subscription_domain = sub.get("domain")
+            subscription_proxy_port = sub.get("proxy_port")
+
+            if subscription_domain and subscription_proxy_port:
+                subscription_address = (
+                    f"http://{subscription_domain}:{subscription_proxy_port}"
+                )
+        except Exception as exc:
+            subscription_error = str(exc)
 
     # ---------------------------------------------------------
     # Deploy
@@ -658,6 +696,13 @@ def deploy_panel(token, repo, port):
         "repo": repo,
         "branch": branch,
         "http": http_url,
+        "panel_domain": http_url,
+        "panel_port": int(port),
+        "subscription_port": 2096 if repo == MY_REPO else None,
+        "subscription_domain": subscription_domain,
+        "subscription_proxy_port": subscription_proxy_port,
+        "subscription_url": subscription_address,
+        "subscription_error": subscription_error,
         "port": port,
         "region": REGION,
         "region_ok": region_ok,
@@ -1019,9 +1064,16 @@ def panel_text(panel):
 
     text = (
         f"📦 <b>{panel.get('name', 'Panel')}</b>\n\n"
-        f"🌐 HTTP: {panel.get('http') or 'ندارد'}\n\n"
-        f"📁 Repo: {panel.get('repo', '-')}\n\n"
-        f"⚙️ Port: {panel.get('port', '-')}\n\n"
+        f"🌐 Panel: {panel.get('panel_domain') or panel.get('http') or 'ندارد'}\n"
+        f"🔵 Panel Port: {panel.get('panel_port', panel.get('port', '-'))}\n\n"
+        + (
+            f"🟢 Subscription Port: {panel.get('subscription_port')}\n"
+            f"🔗 Subscription: {panel.get('subscription_url') or panel.get('subscription_domain') or 'ندارد'}\n\n"
+            if panel.get('repo') == MY_REPO
+            else ""
+        )
+        + f"📁 Repo: {panel.get('repo', '-')}\n\n"
+        + f"⚙️ Port: {panel.get('port', '-')}\n\n"
         f"🌍 Region: {panel.get('region', '-')}\n\n"
         + (
             f"💾 Volume: <code>{panel.get('volume_mount')}</code>\n\n"
